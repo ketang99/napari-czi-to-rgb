@@ -51,6 +51,7 @@ def normalize(img):
     
     img_norm = np.copy(img)
     if len(img.shape) == 3:
+        print('normalizing 3 channels')
         for i in range(img.shape[-1]):
             img_norm[...,i] = normalize_single(img[...,i])
     elif len(img.shape) == 2:
@@ -61,12 +62,13 @@ def normalize(img):
 
 
 # for a given 4-channel image, converts it to RGB with different modes
-def convert_to_rgb(img, convertmode, normbeforecombine=True):
+def convert_to_rgb(img, convertmode, normbeforecombine=False, normaftercombine=False):
     if img.shape[-1] != 4:
         raise Exception('input must have 4 channels')
     
     # img input is BGR
     modes = ['Remove647', 'MergeRed', 'MergeMagenta']
+    print(f"convertmode: {convertmode}")
     if convertmode not in modes:
         raise Exception(f'convertmode must be one of {modes}')
 
@@ -80,13 +82,15 @@ def convert_to_rgb(img, convertmode, normbeforecombine=True):
         img_far = img[...,-1].astype(np.uint16)
         print('img was NOT normalized prior to rgb conversion')
 
-    print(convertmode)
     if convertmode == 'Remove647':
-        return normalize(img_out).astype(np.uint8)
+        pass
     elif convertmode == 'MergeRed': # add the 4th channel to the 1st (R)
         img_out[...,0] += img_far
     elif convertmode == 'MergeMagenta': # add the 4th channel to the 1st and 3rd (B)
         img_out[...,0] += img_far
         img_out[...,2] += img_far
 
-    return normalize(img_out).astype(np.uint8)
+    if normaftercombine:
+        return normalize(img_out).clip(0,255).astype(np.uint8)
+    else:
+        return img_out.clip(0,255).astype(np.uint8)
