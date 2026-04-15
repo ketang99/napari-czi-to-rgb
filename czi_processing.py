@@ -37,11 +37,7 @@ def get_channel_names(metadata):
     return channel_names   
 
 
-# write a function that for a given 4-channel image converts it to RGB with different modes
 def normalize(img):
-    '''
-    will normalize one by one for all channels 
-    '''
 
     def normalize_single(img):
         if len(img.shape) > 2:
@@ -55,23 +51,17 @@ def normalize(img):
     
     img_norm = np.copy(img)
     if len(img.shape) == 3:
-        print('normalizing 3 channels')
         for i in range(img.shape[-1]):
             img_norm[...,i] = normalize_single(img[...,i])
     elif len(img.shape) == 2:
         print('normalizing 1 channels')
         img_norm = normalize_single(img)
     
-    print(img.shape)
-    
     return img_norm
 
 
+# for a given 4-channel image, converts it to RGB with different modes
 def convert_to_rgb(img, convertmode, normbeforecombine=True):
-    '''
-    expects the channel order to be BGRM 
-    '''
-
     if img.shape[-1] != 4:
         raise Exception('input must have 4 channels')
     
@@ -80,8 +70,7 @@ def convert_to_rgb(img, convertmode, normbeforecombine=True):
     if convertmode not in modes:
         raise Exception(f'convertmode must be one of {modes}')
 
-    imgshape = img.shape
-    # this is now in RGB
+    # img_out and img_far flip the channel axis to RGB
     if normbeforecombine:
         img_out = normalize(img[...,-2::-1]).astype(np.uint16)
         img_far = normalize(img[...,-1]).astype(np.uint16)
@@ -96,11 +85,8 @@ def convert_to_rgb(img, convertmode, normbeforecombine=True):
         return normalize(img_out).astype(np.uint8)
     elif convertmode == 'MergeRed': # add the 4th channel to the 1st (R)
         img_out[...,0] += img_far
-        # img_out[...,0] = normalize(img_out[...,0])
     elif convertmode == 'MergeMagenta': # add the 4th channel to the 1st and 3rd (B)
         img_out[...,0] += img_far
-        # img_out[...,0] = normalize(img_out[...,0])
         img_out[...,2] += img_far
-        # img_out[...,2] = normalize(img_out[...,2])
 
     return normalize(img_out).astype(np.uint8)
