@@ -31,7 +31,6 @@ _scenes: dict = {}       # {scene_index: np.ndarray (Y, X, 4)}
 _metadata: dict = {}     # raw metadata dict from backend
 _current_scene: int = 0
 _channel_names: list = []
-# _channel_names = cp.get_channel_names(_metadata)
 
 COLORMAPS = ["blue", "green", "red", "magenta"]   # one per channel (C=4)
 
@@ -44,6 +43,13 @@ def _display_scene(viewer: napari.Viewer, scene_idx: int) -> None:
     global _current_scene
     _current_scene = scene_idx
 
+    # Save current visibility state before clearing
+    # Falls back to all True if no layers exist yet (first load)
+    if len(viewer.layers) == 4:
+        visibility = [viewer.layers[c].visible for c in range(4)]
+    else:
+        visibility = [True, True, True, True]
+
     viewer.layers.clear()
 
     arr = _scenes[scene_idx]   # (Y, X, 4)
@@ -53,7 +59,7 @@ def _display_scene(viewer: napari.Viewer, scene_idx: int) -> None:
             name=_channel_names[c],
             colormap=cmap,
             blending="additive",
-            visible=True,
+            visible=visibility[c],
         )
 
 

@@ -62,7 +62,7 @@ def normalize(img):
 
 
 # for a given 4-channel image, converts it to RGB with different modes
-def convert_to_rgb(img, convertmode, normbeforecombine=False, normaftercombine=False):
+def convert_to_rgb_by_scene(img, convertmode, normbeforecombine=False, normaftercombine=False):
     if img.shape[-1] != 4:
         raise Exception('input must have 4 channels')
     
