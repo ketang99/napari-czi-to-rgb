@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.vscode/
+test_cziread_ometiff.ipynb
