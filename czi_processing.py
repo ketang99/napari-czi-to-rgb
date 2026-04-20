@@ -145,7 +145,7 @@ def convert_to_rgb_all_scenes(scenes, conversion_params):
         print(f'scene {k}')
         if norm_before_combine:
             scenes_out[k] = normalize_single_image(img[...,:n_channels-1], minv[:n_channels-1], maxv[n_channels-1]).astype(np.uint16)
-            scenes_magenta[k] = normalize_single_image(img[...,-1], minv[:-1], maxv[-1]).astype(np.uint16)
+            scenes_magenta[k] = normalize_single_image(img[...,-1], minv[-1], maxv[-1]).astype(np.uint16)
         else:
             scenes_out[k] = img[...,:n_channels-1].astype(np.uint16)   
             scenes_magenta[k] = img[...,-1].astype(np.uint16)
@@ -160,6 +160,8 @@ def convert_to_rgb_all_scenes(scenes, conversion_params):
     else:
         for k, img in scenes_out.items():
             scenes_out[k] = img.clip(0,255).astype(np.uint8)
+
+    print('Conversion complete')
 
     return scenes_out
 
@@ -221,6 +223,3 @@ def convert_to_rgb_by_scene(img, convertmode, normbeforecombine=False, normafter
         return normalize_single_image_old(img_out).clip(0,255).astype(np.uint8)
     else:
         return img_out.clip(0,255).astype(np.uint8)
-    
-
-# def get_intensity_array_all_scenes(scenes):
