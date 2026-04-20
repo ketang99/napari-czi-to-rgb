@@ -1,4 +1,3 @@
-name: improcess
 channels:
   - conda-forge
 dependencies:
@@ -14,4 +13,3 @@ dependencies:
   - libssh2
   - pylibczirw
   - ipywidgets
-prefix: /home/cci/miniforge3/envs/improcess
