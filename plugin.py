@@ -37,36 +37,48 @@ _last_conversion_params: dict = {}
 COLORMAPS_ORIGINAL = ["blue", "green", "red", "magenta"]
 COLORMAPS_RGB      = ["blue", "green", "red"]
 NAMES_RGB          = ["Blue (B)", "Green (G)", "Red (R)"]
-
+_visibility_original: list = [True, True, True, True]
+_visibility_rgb: list = [True, True, True]
 
 # ---------------------------------------------------------------------------
 # Helper: display a scene in the napari viewer
 # ---------------------------------------------------------------------------
+
+def _lock_colormap(layer, cmap: str) -> None:
+    """Snap a layer's colormap back to cmap if it was changed."""
+    if layer.colormap.name != cmap:
+        layer.colormap = cmap
+
+
 def _display_scene(viewer: napari.Viewer, scene_idx: int) -> None:
-    global _current_scene
+    global _current_scene, _visibility_original, _visibility_rgb
     _current_scene = scene_idx
- 
-    # Save visibility state before clearing
-    n_expected = 3 if _view_mode == "rgb" else 4
-    if len(viewer.layers) == n_expected:
-        visibility = [viewer.layers[c].visible for c in range(n_expected)]
-    else:
-        visibility = [True] * n_expected
- 
+
+    # Save current visibility into the correct mode's persistent list
+    # before clearing — only if layer count matches what we expect
+    if _view_mode == "rgb" and len(viewer.layers) == 3:
+        _visibility_rgb = [viewer.layers[c].visible for c in range(3)]
+    elif _view_mode == "original" and len(viewer.layers) == 4:
+        _visibility_original = [viewer.layers[c].visible for c in range(4)]
+
     viewer.layers.clear()
- 
+
     if _view_mode == "rgb" and _scenes_rgb:
-        arr = _scenes_rgb[scene_idx]   # (Y, X, 3)
+        arr = _scenes_rgb[scene_idx]
         for c, (cmap, name) in enumerate(zip(COLORMAPS_RGB, NAMES_RGB)):
-            viewer.add_image(
+            layer = viewer.add_image(
                 arr[:, :, c],
                 name=name,
                 colormap=cmap,
                 blending="additive",
-                visible=visibility[c],
+                visible=_visibility_rgb[c],
+            )
+            # Lock colormap: snap back if user tries to change it
+            layer.events.colormap.connect(
+                lambda e, _layer=layer, _cmap=cmap: _lock_colormap(_layer, _cmap)
             )
     else:
-        arr = _scenes[scene_idx]       # (Y, X, 4)
+        arr = _scenes[scene_idx]
         for c, cmap in enumerate(COLORMAPS_ORIGINAL):
             name = _channel_names[c] if c < len(_channel_names) else f"Ch {c}"
             viewer.add_image(
@@ -74,7 +86,7 @@ def _display_scene(viewer: napari.Viewer, scene_idx: int) -> None:
                 name=name,
                 colormap=cmap,
                 blending="additive",
-                visible=visibility[c],
+                visible=_visibility_original[c],
             )
 
 
@@ -244,7 +256,7 @@ class CZIViewerWidget(QWidget):
             self.path_edit.setText(path)
 
     def _load(self):
-        global _scenes, _metadata, _channel_names, _scenes_rgb, _view_mode
+        global _scenes, _metadata, _channel_names, _scenes_rgb, _view_mode, _visibility_original, _visibility_rgb
  
         path = self.path_edit.text().strip()
         self.status_label.setText("Loading…")
@@ -267,6 +279,8 @@ class CZIViewerWidget(QWidget):
  
         # Reset RGB state
         _scenes_rgb = {}
+        _visibility_original = [True, True, True, True]
+        _visibility_rgb = [True, True, True]
         _view_mode = "original"
         self.radio_original.setChecked(True)
         self.radio_original.setEnabled(False)

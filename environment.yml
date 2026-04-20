@@ -1,0 +1,17 @@
+name: improcess
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pyqt
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - numpy
+  - napari
+  - pytorch
+  - pandas
+  - libssh2
+  - pylibczirw
+  - ipywidgets
+prefix: /home/cci/miniforge3/envs/improcess
