@@ -4,9 +4,42 @@ import numpy as np
 import os, sys
 
 
-def load_czi(path_to_file):
-    # generalize this to read time series data
+CHANNEL_AXIS = 1
 
+
+def _metadata_size(metadata, axis_name, default=1):
+    try:
+        value = metadata['ImageDocument']['Metadata']['Information']['Image'][axis_name]
+    except Exception:
+        return default
+
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _scene_rectangles(czi_file):
+    rectangles = czi_file.scenes_bounding_rectangle
+    if rectangles:
+        return rectangles
+
+    rect = czi_file.total_bounding_rectangle
+    if rect.w <= 0 or rect.h <= 0:
+        return {}
+
+    return {0: rect}
+
+
+def load_czi(path_to_file):
 	# scenes = {}
 	# with pyczi.open_czi(path_to_file) as f:
 	# 	metadata = f.metadata
@@ -30,56 +63,70 @@ def load_czi(path_to_file):
     scenes = {}
     with pyczi.open_czi(path_to_file) as f:
         metadata = f.metadata
-        SizeT = metadata['ImageDocument']['Metadata']['Information']['Image']['SizeT']
-        if int(SizeT) == 1:
-            print('there is only one time')
-            channel_axis = 0
-        else:
-            channel_axis = 1
+        channel_axis = CHANNEL_AXIS
 
         bbox = f.total_bounding_box
         c0, c1 = bbox.get("C", (0, 1))
         z0, z1 = bbox.get("Z", (0, 1))
+        t0, t1 = bbox.get("T", (0, _metadata_size(metadata, "SizeT")))
+        include_t_plane = "T" in bbox or (t1 - t0) > 1
 
-        for scene_idx, rect in f.scenes_bounding_rectangle.items():
-            c_stack = []
+        scene_rectangles = _scene_rectangles(f)
+        if not scene_rectangles:
+            raise ValueError("No readable scene or total image rectangle found in CZI")
 
-            for c in range(c0, c1):
-                z_stack = []
+        for scene_idx, rect in scene_rectangles.items():
+            t_stack = []
 
-                for z in range(z0, z1):
-                    img = f.read(
-                        roi=(rect.x, rect.y, rect.w, rect.h),
-                        plane={"C": c, "Z": z},
-                        scene=scene_idx,
-                    )
+            for t in range(t0, t1):
+                c_stack = []
 
-                    # img is usually (Y, X, 1) for single-channel grayscale
-                    img2d = np.squeeze(img, axis=-1)  # -> (Y, X)
+                for c in range(c0, c1):
+                    z_stack = []
 
-                    z_stack.append(img2d)
+                    for z in range(z0, z1):
+                        plane = {"C": c, "Z": z}
+                        if include_t_plane:
+                            plane["T"] = t
 
-                # -> (Z, Y, X)
-                c_stack.append(np.stack(z_stack, axis=0))
+                        img = f.read(
+                            roi=(rect.x, rect.y, rect.w, rect.h),
+                            plane=plane,
+                            scene=scene_idx,
+                        )
 
-            # -> (C, Z, Y, X)
-            scenes[scene_idx] = np.stack(c_stack, axis=0)
+                        # img is usually (Y, X, 1) for single-channel grayscale
+                        img2d = np.squeeze(img, axis=-1)  # -> (Y, X)
+
+                        z_stack.append(img2d)
+
+                    # -> (Z, Y, X)
+                    c_stack.append(np.stack(z_stack, axis=0))
+
+                # -> (C, Z, Y, X)
+                t_stack.append(np.stack(c_stack, axis=0))
+
+            # -> (T, C, Z, Y, X)
+            scenes[scene_idx] = np.stack(t_stack, axis=0)
     
     return scenes, metadata, channel_axis
 
 
 def get_channel_names(metadata):
-     
-    channel_names = []
     channel_info = metadata['ImageDocument']['Metadata']['Information']['Image']['Dimensions']['Channels']['Channel']
-    for d in channel_info:
-        channel_names.append(d['@Name'])
-    
-    return channel_names   
+    channel_names = []
+
+    for idx, channel in enumerate(_as_list(channel_info)):
+        if isinstance(channel, dict):
+            channel_names.append(channel.get('@Name', f'Ch {idx}'))
+        else:
+            channel_names.append(f'Ch {idx}')
+
+    return channel_names
 
 
 # get the min and max across all the scenes
-def get_intensity_extrema(scenes, channel_axis=0):
+def get_intensity_extrema(scenes, channel_axis=CHANNEL_AXIS):
     
     sample = next(iter(scenes.values()))
     n_channels = sample.shape[channel_axis]
@@ -106,11 +153,12 @@ def get_intensity_extrema(scenes, channel_axis=0):
     return minv, maxv
 
 
-def _percentile_delta_one_channel(scenes, channel_idx, delta, nbins):
+def _percentile_delta_one_channel(scenes, channel_idx, delta, nbins, channel_axis=CHANNEL_AXIS):
     hist = np.zeros(nbins, dtype=np.int64)
 
     for arr in scenes.values():
-        channel_data = arr[channel_idx]  # (Z, Y, X)
+        ch_ax = channel_axis % arr.ndim
+        channel_data = np.take(arr, channel_idx, axis=ch_ax)
         hist += np.bincount(channel_data.ravel(), minlength=nbins)
 
     cdf = np.cumsum(hist)
@@ -125,7 +173,7 @@ def _percentile_delta_one_channel(scenes, channel_idx, delta, nbins):
     return low_val, high_val
 
 
-def percentile_delta_per_channel(scenes, delta=0.05):
+def percentile_delta_per_channel(scenes, delta=0.05, channel_axis=CHANNEL_AXIS):
     if not scenes:
         raise ValueError("scenes is empty")
 
@@ -135,6 +183,8 @@ def percentile_delta_per_channel(scenes, delta=0.05):
     if first.ndim < 4:
         raise ValueError(f"Expected (..., C, Z, Y, X), got {first.shape}")
 
+    ch_ax = channel_axis % first.ndim
+
     if first.dtype == np.uint8:
         nbins = 256
     elif first.dtype == np.uint16:
@@ -142,7 +192,7 @@ def percentile_delta_per_channel(scenes, delta=0.05):
     else:
         raise TypeError(f"Expected uint8 or uint16, got {first.dtype}")
 
-    n_channels = first.shape[0]
+    n_channels = first.shape[ch_ax]
 
     # Validate all scenes
     for img in scenes.values():
@@ -150,7 +200,7 @@ def percentile_delta_per_channel(scenes, delta=0.05):
             raise ValueError(f"Expected (..., C, Z, Y, X), got {img.shape}")
         if img.dtype != first.dtype:
             raise TypeError("All scenes must have same dtype")
-        if img.shape[0] != n_channels:
+        if img.shape[channel_axis % img.ndim] != n_channels:
             raise ValueError("All scenes must have same number of channels")
 
     lows = []
@@ -158,7 +208,7 @@ def percentile_delta_per_channel(scenes, delta=0.05):
 
     for c in range(n_channels):
         low, high = _percentile_delta_one_channel(
-            scenes, channel_idx=c, delta=delta, nbins=nbins
+            scenes, channel_idx=c, delta=delta, nbins=nbins, channel_axis=channel_axis
         )
         lows.append(low)
         highs.append(high)
@@ -168,17 +218,22 @@ def percentile_delta_per_channel(scenes, delta=0.05):
 
 # have options on how to normalize: direct minmax or percentile with default of 1%ile
 # this function will get the minv and maxv for the normalization for each channel
-def get_intensity_stats_all_scenes(scenes, norm_mode='DirectMinMax', pctile=None):
+def get_intensity_stats_all_scenes(
+    scenes,
+    norm_mode='DirectMinMax',
+    pctile=None,
+    channel_axis=CHANNEL_AXIS,
+):
 
     if norm_mode not in ['DirectMinMax', 'Percentile']:
         raise Exception('Normalization mode must be DirectMinMax or Percentile')
     elif norm_mode == 'DirectMinMax':
-        minv, maxv = get_intensity_extrema(scenes)
+        minv, maxv = get_intensity_extrema(scenes, channel_axis)
     elif norm_mode == 'Percentile':
         if not pctile:
             raise Exception('Please enter a numeric percentile value')
         else:
-            minv, maxv = percentile_delta_per_channel(scenes, pctile / 100)
+            minv, maxv = percentile_delta_per_channel(scenes, pctile / 100, channel_axis)
     
     return minv, maxv
 
@@ -235,7 +290,7 @@ def convert_to_rgb_all_scenes(scenes, conversion_params):
         return
 
     img_ndim = next(iter(scenes.values())).ndim
-    channel_axis = conversion_params.get('channel_axis', 0)
+    channel_axis = conversion_params.get('channel_axis', CHANNEL_AXIS)
     n_channels = next(iter(scenes.values())).shape[channel_axis]
     modes = ['RemoveFarRed', 'MergeRed', 'MergeMagenta']
     convert_mode = conversion_params.get('convert_mode', 'RemoveFarRed')
@@ -250,7 +305,12 @@ def convert_to_rgb_all_scenes(scenes, conversion_params):
     
     print(f'norm before merge?, {norm_before_combine}')
     
-    minv, maxv = get_intensity_stats_all_scenes(scenes, norm_mode, pctile_value) # get two (n_channels,) arrays
+    minv, maxv = get_intensity_stats_all_scenes(
+        scenes,
+        norm_mode,
+        pctile_value,
+        channel_axis,
+    ) # get two (n_channels,) arrays
 
     # scenes_out will be the 3 channel output dict, scenes_magenta is to compute the output
     scenes_out = {}
@@ -288,7 +348,12 @@ def convert_to_rgb_all_scenes(scenes, conversion_params):
     
     if norm_after_combine:
         print('normalizing output scenes')
-        nminv, nmaxv = get_intensity_stats_all_scenes(scenes_out, norm_mode, pctile_value)
+        nminv, nmaxv = get_intensity_stats_all_scenes(
+            scenes_out,
+            norm_mode,
+            pctile_value,
+            channel_axis,
+        )
         for k, img in scenes_out.items():
             scenes_out[k] = normalize_single_image(img, nminv, nmaxv).clip(0,upper_intensity).astype(img_type)
     else:

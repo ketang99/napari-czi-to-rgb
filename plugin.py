@@ -27,17 +27,18 @@ import czi_processing as cp
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-_scenes: dict = {}            # {int: np.ndarray (C, Z, Y, X)} — original
-_scenes_rgb: dict = {}        # {int: np.ndarray (C, Z, Y, X)} — converted BGR
+_scenes: dict = {}            # {int: np.ndarray (T, C, Z, Y, X)} — original
+_scenes_rgb: dict = {}        # {int: np.ndarray (T, C, Z, Y, X)} — converted BGR
 _metadata: dict = {}
 _channel_names: list = []
 _scene_keys: list = []
 _current_scene: int = 0
+_current_t: int = 0
 _current_z: int = 0
 _view_mode: str = "original"  # "original" or "rgb"
 _conversion_params: dict = {}
 _last_conversion_params: dict = {}
-_channel_axis: int = 0
+_channel_axis: int = cp.CHANNEL_AXIS
  
 COLORMAPS_ORIGINAL = ["blue", "green", "red", "magenta"]
 COLORMAPS_RGB      = ["blue", "green", "red"]
@@ -55,16 +56,29 @@ def _lock_colormap(layer, cmap: str) -> None:
         layer.colormap = cmap
 
 
-def _channel_slice(arr: np.ndarray, channel_idx: int, z_idx: int) -> np.ndarray:
-    """Return a 2D image from a channel-first or time/channel-first scene."""
+def _time_axis(arr: np.ndarray):
+    ch_ax = _channel_axis % arr.ndim
+    if arr.ndim >= 5 and ch_ax > 0:
+        return ch_ax - 1
+    return None
+
+
+def _channel_slice(
+    arr: np.ndarray,
+    channel_idx: int,
+    t_idx: int,
+    z_idx: int,
+) -> np.ndarray:
+    """Return a 2D image from a (T, C, Z, Y, X) scene."""
     ch_ax = _channel_axis % arr.ndim
     indexer = [slice(None)] * arr.ndim
+
+    t_axis = _time_axis(arr)
+    if t_axis is not None:
+        indexer[t_axis] = min(t_idx, arr.shape[t_axis] - 1)
+
     indexer[ch_ax] = channel_idx
 
-    # Supported shapes for now are (C, Z, Y, X), plus a future
-    # (T, C, Z, Y, X) path where T is displayed at index 0.
-    for ax in range(ch_ax):
-        indexer[ax] = 0
     z_axis = ch_ax + 1 if ch_ax + 1 < arr.ndim else None
     if z_axis is not None and arr.shape[z_axis] > 1:
         indexer[z_axis] = min(z_idx, arr.shape[z_axis] - 1)
@@ -72,6 +86,13 @@ def _channel_slice(arr: np.ndarray, channel_idx: int, z_idx: int) -> np.ndarray:
         indexer[z_axis] = 0
 
     return arr[tuple(indexer)]
+
+
+def _time_count(arr: np.ndarray) -> int:
+    t_axis = _time_axis(arr)
+    if t_axis is None:
+        return 1
+    return arr.shape[t_axis]
 
 
 def _z_count(arr: np.ndarray) -> int:
@@ -114,7 +135,7 @@ def _display_scene(
         arr = _scenes_rgb[scene_idx]
         for c, (cmap, name) in enumerate(zip(COLORMAPS_RGB, NAMES_RGB)):
             layer = viewer.add_image(
-                _channel_slice(arr, c, _current_z),
+                _channel_slice(arr, c, _current_t, _current_z),
                 name=name,
                 colormap=cmap,
                 blending="additive",
@@ -131,7 +152,7 @@ def _display_scene(
             cmap = COLORMAPS_ORIGINAL[c % len(COLORMAPS_ORIGINAL)]
             name = _channel_names[c] if c < len(_channel_names) else f"Ch {c}"
             viewer.add_image(
-                _channel_slice(arr, c, _current_z),
+                _channel_slice(arr, c, _current_t, _current_z),
                 name=name,
                 colormap=cmap,
                 blending="additive",
@@ -210,6 +231,28 @@ class CZIViewerWidget(QWidget):
         scene_slider_row.addWidget(self.next_btn)
         nav_layout.addLayout(scene_slider_row)
 
+        self.t_label = QLabel("Time 1 / ?")
+        self.t_label.setAlignment(Qt.AlignCenter)
+        nav_layout.addWidget(self.t_label)
+
+        self.t_slider = QSlider(Qt.Horizontal)
+        self.t_slider.setMinimum(0)
+        self.t_slider.setTickPosition(QSlider.TicksBelow)
+        self.t_slider.valueChanged.connect(self._on_t_slider)
+        t_slider_row = QHBoxLayout()
+        self.t_prev_btn = QPushButton("◀")
+        self.t_prev_btn.setFixedWidth(34)
+        self.t_prev_btn.setToolTip("Previous time")
+        self.t_prev_btn.clicked.connect(self._prev_t)
+        self.t_next_btn = QPushButton("▶")
+        self.t_next_btn.setFixedWidth(34)
+        self.t_next_btn.setToolTip("Next time")
+        self.t_next_btn.clicked.connect(self._next_t)
+        t_slider_row.addWidget(self.t_prev_btn)
+        t_slider_row.addWidget(self.t_slider)
+        t_slider_row.addWidget(self.t_next_btn)
+        nav_layout.addLayout(t_slider_row)
+
         self.z_label = QLabel("Z 1 / ?")
         self.z_label.setAlignment(Qt.AlignCenter)
         nav_layout.addWidget(self.z_label)
@@ -235,7 +278,7 @@ class CZIViewerWidget(QWidget):
         self.nav_widget.setVisible(False)
         self.nav_dock = self.viewer.window.add_dock_widget(
             self.nav_widget,
-            name="Scene / Z",
+            name="Scene / Time / Z",
             area="bottom",
         )
         self.nav_dock.setVisible(False)
@@ -354,7 +397,7 @@ class CZIViewerWidget(QWidget):
     def _load(self):
         global _scenes, _metadata, _channel_names, _scene_keys, _scenes_rgb
         global _view_mode, _visibility_original, _visibility_rgb, _conversion_params
-        global _channel_axis, _current_z
+        global _channel_axis, _current_t, _current_z
  
         path = self.path_edit.text().strip()
         self.status_label.setText("Loading…")
@@ -368,14 +411,27 @@ class CZIViewerWidget(QWidget):
             self.status_label.setText(f"Error: {e}")
             self.load_btn.setEnabled(True)
             return
+
+        if not _scenes:
+            self.status_label.setText("Error: no readable scenes found in CZI.")
+            self.load_btn.setEnabled(True)
+            return
+
+        sample = next(iter(_scenes.values()))
+        n_channels = sample.shape[_channel_axis]
  
         # Extract channel names from metadata
         try:
-            channels = _metadata["ImageDocument"]["Metadata"]["Information"]["Image"]["Dimensions"]["Channels"]["Channel"]
-            _channel_names = [ch["@Name"] for ch in channels]
+            _channel_names = cp.get_channel_names(_metadata)
         except Exception:
-            sample = next(iter(_scenes.values()))
-            _channel_names = [f"Ch {c}" for c in range(sample.shape[_channel_axis])]
+            _channel_names = []
+
+        if len(_channel_names) < n_channels:
+            _channel_names.extend(
+                f"Ch {c}" for c in range(len(_channel_names), n_channels)
+            )
+        elif len(_channel_names) > n_channels:
+            _channel_names = _channel_names[:n_channels]
 
         _scene_keys = sorted(_scenes.keys())
         _conversion_params = {"channel_axis": _channel_axis}
@@ -386,6 +442,7 @@ class CZIViewerWidget(QWidget):
         _visibility_original = [True] * len(_channel_names)
         _visibility_rgb = [True, True, True]
         _view_mode = "original"
+        _current_t = 0
         _current_z = 0
         self.radio_original.setChecked(True)
         self.radio_original.setEnabled(False)
@@ -401,6 +458,7 @@ class CZIViewerWidget(QWidget):
         self.slider.setValue(0)
         self.slider.setTickInterval(max(1, n // 10))
         self._update_nav_label(0, n)
+        self._set_time_controls_for_scene(_scene_keys[0])
         self._set_z_controls_for_scene(_scene_keys[0])
         self.nav_widget.setVisible(True)
         self.nav_dock.setVisible(True)
@@ -419,9 +477,19 @@ class CZIViewerWidget(QWidget):
             return
         self._update_nav_label(value, n)
         scene_key = _scene_keys[value]
+        self._set_time_controls_for_scene(scene_key)
         self._set_z_controls_for_scene(scene_key)
         _display_scene(self.viewer, scene_key)
         self._update_arrow_states(value, n)
+
+    def _on_t_slider(self, value: int):
+        global _current_t
+        if not _scenes:
+            return
+        _current_t = value
+        self._update_t_label(value, self.t_slider.maximum() + 1)
+        self._update_t_arrow_states(value, self.t_slider.maximum() + 1)
+        _display_scene(self.viewer, _scene_keys[self.slider.value()])
 
     def _on_z_slider(self, value: int):
         global _current_z
@@ -441,6 +509,16 @@ class CZIViewerWidget(QWidget):
         v = self.slider.value()
         if v < self.slider.maximum():
             self.slider.setValue(v + 1)
+
+    def _prev_t(self):
+        v = self.t_slider.value()
+        if v > 0:
+            self.t_slider.setValue(v - 1)
+
+    def _next_t(self):
+        v = self.t_slider.value()
+        if v < self.t_slider.maximum():
+            self.t_slider.setValue(v + 1)
 
     def _prev_z(self):
         v = self.z_slider.value()
@@ -597,6 +675,9 @@ class CZIViewerWidget(QWidget):
     def _update_nav_label(self, idx: int, total: int):
         self.scene_label.setText(f"Scene {idx + 1} / {total}")
 
+    def _update_t_label(self, idx: int, total: int):
+        self.t_label.setText(f"Time {idx + 1} / {total}")
+
     def _update_z_label(self, idx: int, total: int):
         self.z_label.setText(f"Z {idx + 1} / {total}")
  
@@ -604,10 +685,29 @@ class CZIViewerWidget(QWidget):
         self.prev_btn.setEnabled(idx > 0)
         self.next_btn.setEnabled(idx < total - 1)
 
+    def _update_t_arrow_states(self, idx: int, total: int):
+        has_multiple_t = total > 1
+        self.t_prev_btn.setEnabled(has_multiple_t and idx > 0)
+        self.t_next_btn.setEnabled(has_multiple_t and idx < total - 1)
+
     def _update_z_arrow_states(self, idx: int, total: int):
         has_multiple_z = total > 1
         self.z_prev_btn.setEnabled(has_multiple_z and idx > 0)
         self.z_next_btn.setEnabled(has_multiple_z and idx < total - 1)
+
+    def _set_time_controls_for_scene(self, scene_key: int):
+        global _current_t
+        total_t = _time_count(_scenes[scene_key])
+        next_t = min(_current_t, total_t - 1)
+        self.t_slider.blockSignals(True)
+        self.t_slider.setMaximum(total_t - 1)
+        self.t_slider.setValue(next_t)
+        self.t_slider.setTickInterval(max(1, total_t // 10))
+        self.t_slider.setEnabled(total_t > 1)
+        self.t_slider.blockSignals(False)
+        _current_t = next_t
+        self._update_t_label(next_t, total_t)
+        self._update_t_arrow_states(next_t, total_t)
 
     def _set_z_controls_for_scene(self, scene_key: int):
         global _current_z
