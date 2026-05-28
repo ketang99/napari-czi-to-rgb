@@ -11,6 +11,7 @@ Usage:
 import napari
 import numpy as np
 import tifffile
+from skimage import io as skio
 import os
 import traceback
 from qtpy.QtWidgets import (
@@ -39,6 +40,7 @@ _view_mode: str = "original"  # "original" or "rgb"
 _conversion_params: dict = {}
 _last_conversion_params: dict = {}
 _channel_axis: int = cp.CHANNEL_AXIS
+SUPPORTED_EXTENSIONS = (".czi", ".ome.tif", ".ome.tiff", ".tif", ".tiff")
  
 COLORMAPS_ORIGINAL = ["blue", "green", "red", "magenta"]
 COLORMAPS_RGB      = ["blue", "green", "red"]
@@ -107,6 +109,10 @@ def _bgr_to_rgb_for_save(arr: np.ndarray) -> np.ndarray:
     """Move converted BGR channels to RGB-last for TIFF writing."""
     rgb = np.take(arr, [2, 1, 0], axis=_channel_axis)
     return np.moveaxis(rgb, _channel_axis, -1)
+
+
+def _is_supported_image_path(path: str) -> bool:
+    return path.lower().endswith(SUPPORTED_EXTENSIONS)
 
 
 def _remember_layer_visibility(viewer: napari.Viewer, view_mode: str) -> None:
@@ -179,10 +185,10 @@ class CZIViewerWidget(QWidget):
         self.setLayout(root)
 
         # ── File path row ──────────────────────────────────────────────
-        root.addWidget(QLabel("CZI file path:"))
+        root.addWidget(QLabel("Image file path:"))
         path_row = QHBoxLayout()
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("Select or type a .czi path…")
+        self.path_edit.setPlaceholderText("Select or type a .czi, .ome.tif, or .ome.tiff path...")
         self.path_edit.textChanged.connect(self._on_path_changed)
         path_row.addWidget(self.path_edit)
         browse_btn = QPushButton("Browse")
@@ -366,10 +372,16 @@ class CZIViewerWidget(QWidget):
         toggle_row.addWidget(self.radio_rgb)
         rgb_layout.addLayout(toggle_row)
  
-        # Save TIFF button
-        self.save_btn = QPushButton("Save as TIFF")
+        save_row = QHBoxLayout()
+        self.combo_save_format = QComboBox()
+        self.combo_save_format.addItems(["TIFF", "PNG"])
+        save_row.addWidget(QLabel("Save format:"))
+        save_row.addWidget(self.combo_save_format)
+        rgb_layout.addLayout(save_row)
+
+        self.save_btn = QPushButton("Save")
         self.save_btn.setEnabled(False)
-        self.save_btn.clicked.connect(self._save_tiff)
+        self.save_btn.clicked.connect(self._save_converted)
         rgb_layout.addWidget(self.save_btn)
 
         self.reset_rgb_btn = QPushButton("Reset RGB")
@@ -384,12 +396,15 @@ class CZIViewerWidget(QWidget):
     # Slots - file loading
     # ------------------------------------------------------------------
     def _on_path_changed(self, text: str):
-        valid = text.strip().endswith(".czi") and len(text.strip()) > 4
+        valid = _is_supported_image_path(text.strip())
         self.load_btn.setEnabled(valid)
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select CZI file", "", "CZI Files (*.czi)"
+            self,
+            "Select image file",
+            "",
+            "Microscopy Files (*.czi *.ome.tif *.ome.tiff *.tif *.tiff);;CZI Files (*.czi);;OME-TIFF Files (*.ome.tif *.ome.tiff *.tif *.tiff)",
         )
         if path:
             self.path_edit.setText(path)
@@ -405,7 +420,7 @@ class CZIViewerWidget(QWidget):
         self.repaint()
  
         try:
-            _scenes, _metadata, _channel_axis = cp.load_czi(path)
+            _scenes, _metadata, _channel_axis = cp.load_image(path)
         except Exception as e:
             traceback.print_exc()
             self.status_label.setText(f"Error: {e}")
@@ -413,7 +428,7 @@ class CZIViewerWidget(QWidget):
             return
 
         if not _scenes:
-            self.status_label.setText("Error: no readable scenes found in CZI.")
+            self.status_label.setText("Error: no readable scenes found in image file.")
             self.load_btn.setEnabled(True)
             return
 
@@ -450,9 +465,13 @@ class CZIViewerWidget(QWidget):
         self.save_btn.setEnabled(False)
         self.reset_rgb_btn.setEnabled(False)
         self.convert_status.setText("")
+        self._set_rgb_conversion_available(n_channels >= 4)
  
         n = len(_scenes)
-        self.status_label.setText(f"Loaded {n} scene(s).")
+        z_note = ""
+        if _is_supported_image_path(path) and not path.lower().endswith(".czi"):
+            z_note = f" OME-TIFF Z stacks above {cp.MAX_OME_Z} planes are loaded as the middle {cp.MAX_OME_Z} planes."
+        self.status_label.setText(f"Loaded {n} scene(s).{z_note}")
  
         self.slider.setMaximum(n - 1)
         self.slider.setValue(0)
@@ -534,12 +553,20 @@ class CZIViewerWidget(QWidget):
     # Slots — RGB conversion
     # ------------------------------------------------------------------
     def _on_norm_mode_changed(self, text: str):
-        is_pctile = text == "Percentile"
+        is_pctile = text == "Percentile" and self.convert_btn.isEnabled()
         self.pctile_spin.setEnabled(is_pctile)
         self.pctile_label.setEnabled(is_pctile)
  
     def _convert(self):
         global _scenes_rgb, _view_mode, _last_conversion_params, _conversion_params
+
+        if not _scenes:
+            return
+
+        n_channels = next(iter(_scenes.values())).shape[_channel_axis]
+        if n_channels < 4:
+            self.convert_status.setText("RGB conversion requires at least 4 channels.")
+            return
 
         self.convert_status.setText("Converting…")
         self.convert_btn.setEnabled(False)
@@ -624,6 +651,12 @@ class CZIViewerWidget(QWidget):
     # ------------------------------------------------------------------
     # Slots — save
     # ------------------------------------------------------------------
+    def _save_converted(self):
+        if self.combo_save_format.currentText() == "PNG":
+            self._save_png()
+        else:
+            self._save_tiff()
+
     def _save_tiff(self):
         if not _scenes_rgb:
             return
@@ -653,18 +686,61 @@ class CZIViewerWidget(QWidget):
                         metadata=metadata,
                     )
  
-            # Save conversion params as a .txt alongside the tiff
-            params_path = os.path.splitext(save_path)[0] + "_conversion_params.txt"
-            with open(params_path, "w") as f:
-                f.write("CZI RGB Conversion Parameters\n")
-                f.write("=" * 35 + "\n")
-                for key, val in _last_conversion_params.items():
-                    f.write(f"{key}: {val}\n")
-                f.write(f"\nSource file: {self.path_edit.text().strip()}\n")
-                f.write(f"Number of scenes: {len(_scenes_rgb)}\n")
+            self._write_conversion_params(save_path)
  
             self.convert_status.setText(f"Saved to {os.path.basename(save_path)}")
  
+        except Exception as e:
+            traceback.print_exc()
+            self.convert_status.setText(f"Save error: {e}")
+
+    def _save_png(self):
+        if not _scenes_rgb:
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save PNG", "", "PNG Files (*.png)"
+        )
+        if not save_path:
+            return
+
+        if not save_path.lower().endswith(".png"):
+            save_path += ".png"
+
+        try:
+            base, ext = os.path.splitext(save_path)
+            frames = []
+            for scene_key in sorted(_scenes_rgb.keys()):
+                arr_rgb = _bgr_to_rgb_for_save(_scenes_rgb[scene_key])
+                if arr_rgb.ndim == 3:
+                    frames.append((scene_key, None, None, arr_rgb))
+                elif arr_rgb.ndim == 4:
+                    for z in range(arr_rgb.shape[0]):
+                        frames.append((scene_key, None, z, arr_rgb[z]))
+                elif arr_rgb.ndim == 5:
+                    for t in range(arr_rgb.shape[0]):
+                        for z in range(arr_rgb.shape[1]):
+                            frames.append((scene_key, t, z, arr_rgb[t, z]))
+                else:
+                    raise ValueError(f"Cannot save array with shape {arr_rgb.shape} as PNG")
+
+            for scene_key, t, z, frame in frames:
+                out_path = save_path
+                if len(frames) > 1:
+                    parts = [base, f"scene{scene_key}"]
+                    if t is not None:
+                        parts.append(f"t{t:03d}")
+                    if z is not None:
+                        parts.append(f"z{z:03d}")
+                    out_path = "_".join(parts) + ext
+                skio.imsave(out_path, frame)
+
+            self._write_conversion_params(save_path)
+            if len(frames) == 1:
+                self.convert_status.setText(f"Saved to {os.path.basename(save_path)}")
+            else:
+                self.convert_status.setText(f"Saved {len(frames)} PNG files.")
+
         except Exception as e:
             traceback.print_exc()
             self.convert_status.setText(f"Save error: {e}")
@@ -672,6 +748,29 @@ class CZIViewerWidget(QWidget):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _write_conversion_params(self, save_path: str):
+        params_path = os.path.splitext(save_path)[0] + "_conversion_params.txt"
+        with open(params_path, "w") as f:
+            f.write("RGB Conversion Parameters\n")
+            f.write("=" * 35 + "\n")
+            for key, val in _last_conversion_params.items():
+                f.write(f"{key}: {val}\n")
+            f.write(f"\nSource file: {self.path_edit.text().strip()}\n")
+            f.write(f"Number of scenes: {len(_scenes_rgb)}\n")
+
+    def _set_rgb_conversion_available(self, available: bool):
+        self.combo_convert_mode.setEnabled(available)
+        self.combo_norm_mode.setEnabled(available)
+        self.combo_norm_before.setEnabled(available)
+        self.combo_norm_after.setEnabled(available)
+        self.pctile_spin.setEnabled(available and self.combo_norm_mode.currentText() == "Percentile")
+        self.pctile_label.setEnabled(available and self.combo_norm_mode.currentText() == "Percentile")
+        self.convert_btn.setEnabled(available)
+        for combo in self.channel_combos.values():
+            combo.setEnabled(available)
+        if not available:
+            self.convert_status.setText("RGB conversion requires at least 4 channels.")
+
     def _update_nav_label(self, idx: int, total: int):
         self.scene_label.setText(f"Scene {idx + 1} / {total}")
 
@@ -747,7 +846,7 @@ class CZIViewerWidget(QWidget):
 def main():
     viewer = napari.Viewer()
     widget = CZIViewerWidget(viewer)
-    viewer.window.add_dock_widget(widget, name="CZI Viewer", area="right")
+    viewer.window.add_dock_widget(widget, name="CZI / OME-TIFF Viewer", area="right")
     napari.run()
  
  

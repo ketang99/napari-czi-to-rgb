@@ -1,10 +1,13 @@
 from pylibCZIrw import czi as pyczi
+from bioio import BioImage
 import json
 import numpy as np
 import os, sys
 
 
 CHANNEL_AXIS = 1
+CANONICAL_AXES = "TCZYX"
+MAX_OME_Z = 30
 
 
 def _metadata_size(metadata, axis_name, default=1):
@@ -112,15 +115,128 @@ def load_czi(path_to_file):
     return scenes, metadata, channel_axis
 
 
-def get_channel_names(metadata):
-    channel_info = metadata['ImageDocument']['Metadata']['Information']['Image']['Dimensions']['Channels']['Channel']
-    channel_names = []
+def _pixel_size(pixel_info, dim):
+    try:
+        return getattr(pixel_info, f"size_{dim.lower()}")
+    except Exception:
+        return None
 
-    for idx, channel in enumerate(_as_list(channel_info)):
-        if isinstance(channel, dict):
-            channel_names.append(channel.get('@Name', f'Ch {idx}'))
-        else:
-            channel_names.append(f'Ch {idx}')
+
+def _scene_name(img, scene_idx):
+    try:
+        return img.scenes[scene_idx]
+    except Exception:
+        return scene_idx
+
+
+def _get_bioimage_data_tczyx(img):
+    try:
+        return img.get_image_data(CANONICAL_AXES)
+    except Exception:
+        pass
+
+    data = np.asarray(img.data)
+    try:
+        order = "".join(img.dims.order)
+    except Exception:
+        order = ""
+
+    if order:
+        order = order.upper()
+        for axis in CANONICAL_AXES:
+            if axis not in order:
+                data = np.expand_dims(data, axis=0)
+                order = axis + order
+        axis_order = [order.index(axis) for axis in CANONICAL_AXES]
+        return np.transpose(data, axis_order)
+
+    metadata = img.metadata
+    pixel_info = metadata.images[0].pixels
+    expected_sizes = {
+        axis: _pixel_size(pixel_info, axis)
+        for axis in ("t", "c", "z", "y", "x")
+    }
+
+    remaining_axes = list(CANONICAL_AXES)
+    source_axes = []
+    for size in data.shape:
+        matches = [axis for axis in remaining_axes if expected_sizes[axis.lower()] == size]
+        axis = matches[0] if matches else remaining_axes[0]
+        source_axes.append(axis)
+        remaining_axes.remove(axis)
+
+    for axis in remaining_axes:
+        data = np.expand_dims(data, axis=0)
+        source_axes.insert(0, axis)
+
+    axis_order = [source_axes.index(axis) for axis in CANONICAL_AXES]
+    return np.transpose(data, axis_order)
+
+
+def _trim_middle_z(arr, max_z=MAX_OME_Z):
+    z_axis = CANONICAL_AXES.index("Z")
+    n_z = arr.shape[z_axis]
+    if n_z <= max_z:
+        return arr
+
+    start = (n_z - max_z) // 2
+    stop = start + max_z
+    indexer = [slice(None)] * arr.ndim
+    indexer[z_axis] = slice(start, stop)
+    return arr[tuple(indexer)]
+
+
+def load_ometiff(path_to_file, max_z=MAX_OME_Z):
+    """Load OME-TIFF scenes as {scene: (T, C, Z, Y, X)}."""
+    img = BioImage(path_to_file)
+    metadata = img.metadata
+    scenes = {}
+
+    try:
+        scene_count = len(img.scenes)
+    except Exception:
+        scene_count = 1
+
+    for scene_idx in range(scene_count):
+        try:
+            img.set_scene(_scene_name(img, scene_idx))
+        except Exception:
+            pass
+
+        arr = _get_bioimage_data_tczyx(img)
+        scenes[scene_idx] = _trim_middle_z(np.asarray(arr), max_z=max_z)
+
+    return scenes, metadata, CHANNEL_AXIS
+
+
+def load_image(path_to_file):
+    suffix = path_to_file.lower()
+    if suffix.endswith(".czi"):
+        return load_czi(path_to_file)
+    if suffix.endswith((".ome.tif", ".ome.tiff", ".tif", ".tiff")):
+        return load_ometiff(path_to_file)
+    raise ValueError("Unsupported file type. Please select a .czi, .ome.tif, .ome.tiff, .tif, or .tiff file.")
+
+
+def get_channel_names(metadata):
+    try:
+        channel_info = metadata['ImageDocument']['Metadata']['Information']['Image']['Dimensions']['Channels']['Channel']
+        channel_names = []
+
+        for idx, channel in enumerate(_as_list(channel_info)):
+            if isinstance(channel, dict):
+                channel_names.append(channel.get('@Name', f'Ch {idx}'))
+            else:
+                channel_names.append(f'Ch {idx}')
+
+        return channel_names
+    except Exception:
+        pass
+
+    pixel_info = metadata.images[0].pixels
+    channel_names = []
+    for idx, channel in enumerate(pixel_info.channels):
+        channel_names.append(channel.name or f"Ch {idx}")
 
     return channel_names
 
